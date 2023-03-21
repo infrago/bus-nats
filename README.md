@@ -1,2 +1,2 @@
 # bus-nats
-infra.go nats bus driver.
+infra.Go nats bus driver.
