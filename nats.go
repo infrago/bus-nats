@@ -52,6 +52,9 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connect, error) {
 	if vv, ok := inst.Config.Setting["url"].(string); ok {
 		setting.Url = vv
 	}
+	if vv, ok := inst.Config.Setting["server"].(string); ok {
+		setting.Url = vv
+	}
 
 	if vv, ok := inst.Config.Setting["user"].(string); ok {
 		setting.Username = vv
@@ -102,7 +105,7 @@ func (this *natsBusConnect) Close() error {
 	return nil
 }
 
-// 注册
+// Rregister 注册
 func (this *natsBusConnect) Register(name string) error {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
