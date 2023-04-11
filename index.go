@@ -2,6 +2,7 @@ package bus_nats
 
 import (
 	"github.com/infrago/bus"
+	"github.com/infrago/infra"
 )
 
 func Driver() bus.Driver {
@@ -9,5 +10,5 @@ func Driver() bus.Driver {
 }
 
 func init() {
-	bus.Register("nats", Driver())
+	infra.Register("nats", Driver())
 }
