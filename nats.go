@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +39,9 @@ type (
 		setting  natsBusSetting
 		client   *nats.Conn
 
-		subjects map[string]struct{}
+		services map[string]struct{}
+		messages map[string]struct{}
+		retries  map[string][]time.Duration
 		subs     []*nats.Subscription
 
 		identity infra.NodeInfo
@@ -159,7 +162,9 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	return &natsBusConnection{
 		instance: inst,
 		setting:  setting,
-		subjects: make(map[string]struct{}, 0),
+		services: make(map[string]struct{}, 0),
+		messages: make(map[string]struct{}, 0),
+		retries:  make(map[string][]time.Duration, 0),
 		subs:     make([]*nats.Subscription, 0),
 		identity: infra.NodeInfo{
 			Project: project,
@@ -177,9 +182,17 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	}, nil
 }
 
-func (c *natsBusConnection) Register(subject string) error {
+func (c *natsBusConnection) RegisterService(subject string, retries []time.Duration) error {
 	c.mutex.Lock()
-	c.subjects[subject] = struct{}{}
+	c.services[subject] = struct{}{}
+	c.retries[subject] = append([]time.Duration{}, retries...)
+	c.mutex.Unlock()
+	return nil
+}
+
+func (c *natsBusConnection) RegisterMessage(subject string) error {
+	c.mutex.Lock()
+	c.messages[subject] = struct{}{}
 	c.mutex.Unlock()
 	return nil
 }
@@ -219,11 +232,9 @@ func (c *natsBusConnection) Start() error {
 		return errNatsInvalidConnection
 	}
 
-	for subject := range c.subjects {
+	for subject := range c.services {
 		callSubject := "call." + subject
 		queueSubject := "queue." + subject
-		eventSubject := "event." + subject
-		groupSubject := "publish." + subject
 
 		callSub, err := c.client.QueueSubscribe(callSubject, c.queueGroup(callSubject), func(msg *nats.Msg) {
 			started := time.Now()
@@ -243,7 +254,26 @@ func (c *natsBusConnection) Start() error {
 
 		queueSub, err := c.client.QueueSubscribe(queueSubject, c.queueGroup(queueSubject), func(msg *nats.Msg) {
 			started := time.Now()
-			asyncErr := c.handleAsync(msg.Data)
+			attempt := queueAttempt(msg.Header)
+			after := queueAfter(msg.Header)
+			retries := c.retries[subject]
+			if after > 0 {
+				now := time.Now()
+				target := time.Unix(after, 0)
+				if target.After(now) {
+					time.Sleep(time.Second)
+					_ = c.publishQueue(queueSubject, msg.Data, attempt, target.Sub(now))
+					c.recordStats(subject, time.Since(started), nil)
+					return
+				}
+			}
+
+			asyncErr := c.handleServiceAsync(msg.Data, attempt, bus.DispatchFinal(retries, attempt))
+			if asyncErr != nil && bus.IsRetryableDispatchError(asyncErr) {
+				if delay, ok := bus.DispatchRetryDelay(retries, attempt); ok {
+					_ = c.publishQueue(queueSubject, msg.Data, attempt+1, delay)
+				}
+			}
 			c.recordStats(subject, time.Since(started), asyncErr)
 		})
 		if err != nil {
@@ -252,9 +282,15 @@ func (c *natsBusConnection) Start() error {
 		}
 		c.subs = append(c.subs, queueSub)
 
+	}
+
+	for subject := range c.messages {
+		eventSubject := "event." + subject
+		groupSubject := "publish." + subject
+
 		eventSub, err := c.client.Subscribe(eventSubject, func(msg *nats.Msg) {
 			started := time.Now()
-			asyncErr := c.handleAsync(msg.Data)
+			asyncErr := c.handleMessage(msg.Data)
 			c.recordStats(subject, time.Since(started), asyncErr)
 		})
 		if err != nil {
@@ -265,7 +301,7 @@ func (c *natsBusConnection) Start() error {
 
 		groupSub, err := c.client.QueueSubscribe(groupSubject, c.publishGroup(groupSubject), func(msg *nats.Msg) {
 			started := time.Now()
-			asyncErr := c.handleAsync(msg.Data)
+			asyncErr := c.handleMessage(msg.Data)
 			c.recordStats(subject, time.Since(started), asyncErr)
 		})
 		if err != nil {
@@ -347,6 +383,9 @@ func (c *natsBusConnection) Publish(subject string, data []byte) error {
 func (c *natsBusConnection) Enqueue(subject string, data []byte) error {
 	if c.client == nil {
 		return errNatsInvalidConnection
+	}
+	if strings.HasPrefix(subject, "queue.") {
+		return c.publishQueue(subject, data, 1, 0)
 	}
 	return c.client.Publish(subject, data)
 }
@@ -472,11 +511,18 @@ func (c *natsBusConnection) handleCall(data []byte) ([]byte, error) {
 	return c.instance.HandleCall(data)
 }
 
-func (c *natsBusConnection) handleAsync(data []byte) error {
+func (c *natsBusConnection) handleServiceAsync(data []byte, attempt int, final bool) error {
 	if c.instance == nil {
 		c.instance = &bus.Instance{}
 	}
-	return c.instance.HandleAsync(data)
+	return c.instance.HandleServiceAsync(data, attempt, final)
+}
+
+func (c *natsBusConnection) handleMessage(data []byte) error {
+	if c.instance == nil {
+		c.instance = &bus.Instance{}
+	}
+	return c.instance.HandleMessage(data)
 }
 
 func (c *natsBusConnection) recordStats(subject string, cost time.Duration, err error) {
@@ -629,8 +675,8 @@ func (c *natsBusConnection) currentServices() []string {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	names := make([]string, 0, len(c.subjects))
-	for name := range c.subjects {
+	names := make([]string, 0, len(c.services))
+	for name := range c.services {
 		names = append(names, c.serviceName(name))
 	}
 	sort.Strings(names)
@@ -702,8 +748,55 @@ func parseDurationSetting(v any) time.Duration {
 		if d, err := time.ParseDuration(vv); err == nil {
 			return d
 		}
+		if n, err := strconv.Atoi(strings.TrimSpace(vv)); err == nil {
+			return time.Second * time.Duration(n)
+		}
 	}
 	return 0
+}
+
+func (c *natsBusConnection) publishQueue(subject string, data []byte, attempt int, delay time.Duration) error {
+	msg := nats.NewMsg(subject)
+	msg.Data = data
+	msg.Header = nats.Header{}
+	if attempt <= 0 {
+		attempt = 1
+	}
+	msg.Header.Set("attempt", strconv.Itoa(attempt))
+	if delay > 0 {
+		msg.Header.Set("after", strconv.FormatInt(time.Now().Add(delay).Unix(), 10))
+	}
+	return c.client.PublishMsg(msg)
+}
+
+func queueAttempt(header nats.Header) int {
+	if header == nil {
+		return 1
+	}
+	raw := strings.TrimSpace(header.Get("attempt"))
+	if raw == "" {
+		return 1
+	}
+	val, err := strconv.Atoi(raw)
+	if err != nil || val <= 0 {
+		return 1
+	}
+	return val
+}
+
+func queueAfter(header nats.Header) int64 {
+	if header == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(header.Get("after"))
+	if raw == "" {
+		return 0
+	}
+	val, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return val
 }
 
 func uniqueStrings(in []string) []string {

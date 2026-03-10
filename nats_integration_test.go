@@ -3,12 +3,13 @@ package bus_nats
 import (
 	"fmt"
 	"net"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/infrago/infra"
 	base "github.com/infrago/base"
 	"github.com/infrago/bus"
+	"github.com/infrago/infra"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -31,11 +32,15 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 	defer ns.Shutdown()
 
 	serviceName := fmt.Sprintf("bus.test.%d", time.Now().UnixNano())
-	infra.Register(serviceName, infra.Method{
+	infra.Register(serviceName, infra.Service{
 		Action: func(ctx *infra.Context) (base.Map, base.Res) {
 			return base.Map{"ok": true, "name": serviceName}, infra.OK
 		},
 	})
+	argv := os.Args
+	os.Args = []string{argv[0]}
+	defer func() { os.Args = argv }()
+	infra.Prepare()
 
 	url := fmt.Sprintf("nats://%s", addr.String())
 
@@ -52,7 +57,7 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 	if err := responder1.Open(); err != nil {
 		t.Fatalf("open responder1 failed: %v", err)
 	}
-	if err := responder1.Register(serviceName); err != nil {
+	if err := responder1.RegisterService(serviceName, nil); err != nil {
 		t.Fatalf("register responder1 failed: %v", err)
 	}
 	if err := responder1.Start(); err != nil {
@@ -73,7 +78,7 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 	if err := responder2.Open(); err != nil {
 		t.Fatalf("open responder2 failed: %v", err)
 	}
-	if err := responder2.Register(serviceName); err != nil {
+	if err := responder2.RegisterService(serviceName, nil); err != nil {
 		t.Fatalf("register responder2 failed: %v", err)
 	}
 	if err := responder2.Start(); err != nil {
@@ -96,8 +101,8 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 	}
 
 	reqBody := map[string]any{
-		"name":    serviceName,
-		"payload": map[string]any{"hello": "world"},
+		"Name":    serviceName,
+		"Payload": map[string]any{"hello": "world"},
 	}
 	reqBytes, _ := msgpack.Marshal(reqBody)
 
