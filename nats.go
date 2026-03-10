@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/infrago/infra"
 	"github.com/infrago/bus"
+	"github.com/infrago/infra"
 	"github.com/nats-io/nats.go"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -114,9 +114,10 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	}
 	if v := strings.TrimSpace(inst.Config.Group); v != "" {
 		setting.PublishGroup = v
-	}
-	if v, ok := inst.Config.Setting["profile"].(string); ok && v != "" {
-		setting.PublishGroup = v
+	} else if v, ok := inst.Config.Setting["role"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.PublishGroup = strings.TrimSpace(v)
+	} else if v, ok := inst.Config.Setting["profile"].(string); ok && strings.TrimSpace(v) != "" {
+		setting.PublishGroup = strings.TrimSpace(v)
 	}
 	if v, ok := inst.Config.Setting["version"].(string); ok && v != "" {
 		setting.Version = v
@@ -151,6 +152,10 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	if strings.TrimSpace(profile) == "" {
 		profile = infra.INFRAGO
 	}
+	role := id.Role
+	if strings.TrimSpace(role) == "" {
+		role = profile
+	}
 	return &natsBusConnection{
 		instance: inst,
 		setting:  setting,
@@ -159,6 +164,7 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 		identity: infra.NodeInfo{
 			Project: project,
 			Node:    node,
+			Role:    role,
 			Profile: profile,
 		},
 		cache:            make(map[string]infra.NodeInfo, 0),
@@ -383,10 +389,13 @@ func (c *natsBusConnection) ListNodes() []infra.NodeInfo {
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Project == out[j].Project {
-			if out[i].Profile == out[j].Profile {
-				return out[i].Node < out[j].Node
+			if out[i].Role == out[j].Role {
+				if out[i].Profile == out[j].Profile {
+					return out[i].Node < out[j].Node
+				}
+				return out[i].Profile < out[j].Profile
 			}
-			return out[i].Profile < out[j].Profile
+			return out[i].Role < out[j].Role
 		}
 		return out[i].Project < out[j].Project
 	})
@@ -409,6 +418,7 @@ func (c *natsBusConnection) ListServices() []infra.ServiceInfo {
 			}
 			info.Nodes = append(info.Nodes, infra.ServiceNode{
 				Node:    node.Node,
+				Role:    node.Role,
 				Profile: node.Profile,
 			})
 			if node.Updated > info.Updated {
@@ -420,10 +430,13 @@ func (c *natsBusConnection) ListServices() []infra.ServiceInfo {
 	out := make([]infra.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
-			if info.Nodes[i].Profile == info.Nodes[j].Profile {
-				return info.Nodes[i].Node < info.Nodes[j].Node
+			if info.Nodes[i].Role == info.Nodes[j].Role {
+				if info.Nodes[i].Profile == info.Nodes[j].Profile {
+					return info.Nodes[i].Node < info.Nodes[j].Node
+				}
+				return info.Nodes[i].Profile < info.Nodes[j].Profile
 			}
-			return info.Nodes[i].Profile < info.Nodes[j].Profile
+			return info.Nodes[i].Role < info.Nodes[j].Role
 		})
 		info.Instances = len(info.Nodes)
 		out = append(out, *info)
@@ -444,7 +457,7 @@ func (c *natsBusConnection) queueGroup(subject string) string {
 func (c *natsBusConnection) publishGroup(subject string) string {
 	group := strings.TrimSpace(c.setting.PublishGroup)
 	if group == "" {
-		group = strings.TrimSpace(c.identity.Profile)
+		group = strings.TrimSpace(c.identity.Role)
 	}
 	if group == "" {
 		group = infra.GLOBAL
@@ -485,6 +498,7 @@ func (c *natsBusConnection) recordStats(subject string, cost time.Duration, err 
 type announcePayload struct {
 	Project  string   `json:"project"`
 	Node     string   `json:"node"`
+	Role     string   `json:"role"`
 	Profile  string   `json:"profile"`
 	Services []string `json:"services"`
 	Updated  int64    `json:"updated"`
@@ -544,6 +558,7 @@ func (c *natsBusConnection) publishAnnounceState(online bool) {
 	payload := announcePayload{
 		Project: c.identity.Project,
 		Node:    c.identity.Node,
+		Role:    c.identity.Role,
 		Profile: c.identity.Profile,
 		Updated: time.Now().UnixMilli(),
 	}
@@ -588,6 +603,7 @@ func (c *natsBusConnection) onAnnounce(data []byte) {
 	c.cache[key] = infra.NodeInfo{
 		Project:  payload.Project,
 		Node:     payload.Node,
+		Role:     payload.Role,
 		Profile:  payload.Profile,
 		Services: uniqueStrings(payload.Services),
 		Updated:  payload.Updated,

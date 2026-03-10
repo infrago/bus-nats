@@ -33,7 +33,8 @@ driver = "nats"
 - `pass`
 - `password`
 - `group`
-- `profile`
+- `role`
+- `profile`（兼容旧配置，未设置 `role` 时可继续使用）
 - `version`
 - `announce`
 - `announce_ttl`
